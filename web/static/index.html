@@ -112,7 +112,13 @@
                                     <option value="6">近6个月</option>
                                     <option value="12">近1年</option>
                                     <option value="24">近2年</option>
+                                    <option value="999">自定义</option>
                                 </select>
+                                <div id="customTimeRange" style="align-items:center;gap:6px">
+                                    <input type="datetime-local" id="sinceTime" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px">
+                                    <span style="font-size:13px;color:#666">至</span>
+                                    <input type="datetime-local" id="untilTime" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px">
+                                </div>
                                 <button class="btn btn-primary" id="exportSelectedBtn" disabled>导出选中会话</button>
                             </div>
                         </div>

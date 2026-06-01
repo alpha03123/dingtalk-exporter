@@ -1,10 +1,85 @@
-import os
-import sys
 import logging
+import os
+import re
+import sys
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logger = logging.getLogger(__name__)
+
+
+def _load_redirected_dingtalk_bases():
+    """Read any DingTalk app-data redirection targets configured by the client."""
+    bases = []
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return bases
+
+    redirect_file = os.path.join(appdata, "DingTalk", "redirectAppData.dat")
+    if not os.path.isfile(redirect_file):
+        return bases
+
+    try:
+        with open(redirect_file, "r", encoding="utf-8") as f:
+            redirected = f.read().strip().strip("\x00")
+    except OSError as e:
+        logger.warning(f"Failed to read DingTalk redirect file {redirect_file}: {e}")
+        return bases
+
+    if redirected and os.path.isdir(redirected):
+        bases.append(os.path.normpath(redirected))
+        logger.info(f"Detected redirected DingTalk data dir: {redirected}")
+
+    return bases
+
+
+def _detect_v3_numeric_uid(data_dir, fallback_uid):
+    """Try to resolve the real numeric UID used by DingTalk V3 databases.
+
+    V3 folder names are not always the same as the chat-database UID. In
+    practice, the real UID is commonly surfaced in local client logs.
+    """
+    base_dir = os.path.dirname(os.path.normpath(data_dir))
+    log_dir = os.path.join(base_dir, "log")
+    if not os.path.isdir(log_dir):
+        return fallback_uid
+
+    patterns = [
+        re.compile(r"uid=(\d{10})"),
+        re.compile(r"myOpenId=(\d{10})"),
+        re.compile(r"cid=(\d{10}):"),
+    ]
+    scores = {}
+
+    try:
+        log_names = sorted(
+            name for name in os.listdir(log_dir)
+            if name.startswith(("cef_debug.log", "gaea.log"))
+        )[-12:]
+    except OSError as e:
+        logger.warning(f"Failed to inspect DingTalk log dir {log_dir}: {e}")
+        return fallback_uid
+
+    for name in log_names:
+        path = os.path.join(log_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                uid = match.group(1)
+                scores[uid] = scores.get(uid, 0) + 1
+
+    if not scores:
+        return fallback_uid
+
+    uid, _ = max(scores.items(), key=lambda item: (item[1], item[0]))
+    if uid != fallback_uid:
+        logger.info(f"Resolved DingTalk V3 numeric UID from logs: {uid}")
+    return uid
 
 
 def _detect_dingtalk_user():
@@ -39,6 +114,7 @@ def _detect_dingtalk_user():
         search_bases.append(os.path.join(userprofile, "AppData", "Roaming", "DingTalk"))
         search_bases.append(os.path.join(userprofile, "AppData", "Local", "DingTalk"))
         search_bases.append(os.path.join(userprofile, "DingTalk"))
+    search_bases.extend(_load_redirected_dingtalk_bases())
 
     # macOS and Linux paths
     home = os.path.expanduser("~")
@@ -70,6 +146,8 @@ def _detect_dingtalk_user():
                     db_file = os.path.join(full_path, "DBFiles", "dingtalk.db")
                     if os.path.exists(db_file):
                         uid = entry.rsplit("_v", 1)[0]
+                        if entry.endswith("_v3"):
+                            uid = _detect_v3_numeric_uid(full_path, uid)
                         mtime = os.path.getmtime(db_file)
                         v2_dirs.append((uid, full_path, mtime))
 
@@ -209,7 +287,8 @@ CONTENT_TYPE_NAMES = {
 }
 
 # Web server settings
-WEB_HOST = "0.0.0.0"
+# WEB_HOST = "0.0.0.0"
+WEB_HOST = "localhost"
 WEB_PORT = 8090
 
 # Ensure directories exist

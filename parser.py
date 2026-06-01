@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import logging
 from datetime import datetime
@@ -19,14 +20,61 @@ MSG_TYPE_APPROVAL = 1400
 MSG_TYPE_VIDEO_CALL = 1101
 
 
+class DatabaseNotReadyError(RuntimeError):
+    """Raised when the decrypted DingTalk database is missing or unusable."""
+
+
+def _validate_database_schema(conn):
+    """Ensure the decrypted database contains the tables this app requires."""
+    table_names = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+    if "tbconversation" not in table_names:
+        raise DatabaseNotReadyError(
+            "解密后的聊天数据库尚未就绪，请先点击“手动同步”完成首次解密。"
+        )
+
+    if "tbuser_profile_v2" not in table_names:
+        raise DatabaseNotReadyError(
+            "解密后的聊天数据库缺少用户资料表，请重新执行一次手动同步。"
+        )
+
+    if not any(name.startswith("tbmsg_") for name in table_names):
+        raise DatabaseNotReadyError(
+            "解密后的聊天数据库缺少消息分表，请重新执行一次手动同步。"
+        )
+
+
 def get_connection(db_path=None):
     """Get a SQLite connection to the decrypted database."""
     if db_path is None:
         db_path = config.DECRYPTED_DB_PATH
+    if not os.path.isfile(db_path):
+        raise DatabaseNotReadyError(
+            "未找到解密后的聊天数据库，请先点击“手动同步”完成首次解密。"
+        )
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        _validate_database_schema(conn)
+    except DatabaseNotReadyError:
+        conn.close()
+        raise
     return conn
+
+
+def get_database_status(db_path=None):
+    """Return whether the decrypted database is ready for queries."""
+    try:
+        conn = get_connection(db_path)
+    except DatabaseNotReadyError as exc:
+        return {"ready": False, "error": str(exc)}
+    else:
+        conn.close()
+        return {"ready": True, "error": None}
 
 
 def get_conversations(conn, limit=100, offset=0, keyword=None):

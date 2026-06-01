@@ -14,6 +14,7 @@ import uvicorn
 log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(
     level=logging.INFO,
+    # level=logging.DEBUG,
     format=log_format,
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -44,6 +45,12 @@ if __name__ == "__main__":
         logger.warning(
             f"DingTalk database not found at: {config.ENCRYPTED_DB}\n"
             f"Make sure DingTalk desktop client is installed and logged in on this machine."
+        )
+    if config.DINGTALK_DATA_DIR.endswith("_v3"):
+        logger.warning(
+            "Detected a DingTalk V3 data directory: %s\n"
+            "The bundled decryption workflow in this project is only known to work reliably with V2 data.",
+            config.DINGTALK_DATA_DIR,
         )
 
     uvicorn.run(

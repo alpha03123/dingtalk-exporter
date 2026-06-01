@@ -1,12 +1,22 @@
 import os
 import logging
+import subprocess
+import sys
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
-from parser import get_connection, get_conversations, get_messages, search_messages, get_conversation_stats
+from parser import (
+    DatabaseNotReadyError,
+    get_connection,
+    get_conversations,
+    get_messages,
+    search_messages,
+    get_conversation_stats,
+    get_database_status,
+)
 from scheduler import get_sync_state, do_sync, setup_scheduler
 
 logger = logging.getLogger(__name__)
@@ -23,6 +33,19 @@ app.add_middleware(
 
 # Scheduler (initialized lazily)
 _scheduler = None
+
+
+def _query_db(callback):
+    """Run a callback with a validated database connection."""
+    try:
+        conn = get_connection()
+    except DatabaseNotReadyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    try:
+        return callback(conn)
+    finally:
+        conn.close()
 
 
 @app.on_event("startup")
@@ -73,12 +96,9 @@ async def api_conversations(
     offset: int = Query(0, ge=0),
     keyword: str = Query(None),
 ):
-    conn = get_connection()
-    try:
-        result = get_conversations(conn, limit=limit, offset=offset, keyword=keyword)
-        return result
-    finally:
-        conn.close()
+    return _query_db(
+        lambda conn: get_conversations(conn, limit=limit, offset=offset, keyword=keyword)
+    )
 
 
 @app.get("/api/conversations/{cid}/messages")
@@ -89,12 +109,11 @@ async def api_messages(
     since: int = Query(None, description="Since timestamp (ms)"),
     until: int = Query(None, description="Until timestamp (ms)"),
 ):
-    conn = get_connection()
-    try:
-        result = get_messages(conn, cid, limit=limit, offset=offset, since_time=since, until_time=until)
-        return result
-    finally:
-        conn.close()
+    return _query_db(
+        lambda conn: get_messages(
+            conn, cid, limit=limit, offset=offset, since_time=since, until_time=until
+        )
+    )
 
 
 @app.get("/api/search")
@@ -103,27 +122,24 @@ async def api_search(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    conn = get_connection()
-    try:
+    def _search(conn):
         results = search_messages(conn, q, limit=limit, offset=offset)
         return {"query": q, "total": len(results), "messages": results}
-    finally:
-        conn.close()
+
+    return _query_db(_search)
 
 
 @app.get("/api/stats")
 async def api_stats():
-    conn = get_connection()
-    try:
-        stats = get_conversation_stats(conn)
-        return stats
-    finally:
-        conn.close()
+    return _query_db(get_conversation_stats)
 
 
 @app.get("/api/sync/status")
 async def api_sync_status():
     state = get_sync_state()
+    db_status = get_database_status()
+    state["database_ready"] = db_status["ready"]
+    state["database_error"] = db_status["error"]
     return state
 
 
@@ -146,26 +162,27 @@ async def api_export_selected(body: dict):
     """Export only the selected conversation IDs as JSON."""
     cids = body.get("cids", [])
     since_time = body.get("since_time")  # optional ms timestamp
+    until_time = body.get("until_time")  # optional ms timestamp
     if not cids:
         raise HTTPException(status_code=400, detail="No conversations selected")
 
     import threading
 
     thread = threading.Thread(
-        target=_do_export_selected, args=(cids, since_time), daemon=True
+        target=_do_export_selected, args=(cids, since_time, until_time), daemon=True
     )
     thread.start()
     return {"status": "started", "selected_count": len(cids)}
 
 
-def _do_export_selected(cids, since_time=None):
+def _do_export_selected(cids, since_time=None, until_time=None):
     """Run the selected export in a background thread."""
     import scheduler as sched
     sched._sync_state["is_syncing"] = True
     sched._sync_state["last_error"] = None
     try:
         from exporter import export_by_cids
-        path = export_by_cids(cids, since_time=since_time)
+        path = export_by_cids(cids, since_time=since_time, until_time=until_time)
         sched._sync_state["last_export_path"] = path
         sched._sync_state["sync_count"] += 1
     except Exception as e:
@@ -272,6 +289,30 @@ async def api_export_download(name: str):
         media_type="application/json",
         filename=os.path.basename(export_path),
     )
+
+
+@app.post("/api/exports/{name}/open-folder")
+async def api_export_open_folder(name: str):
+    """Open the export directory in the local file manager."""
+    export_path = os.path.join(config.EXPORT_DIR, name)
+    export_path = os.path.normpath(export_path)
+    if not export_path.startswith(os.path.normpath(config.EXPORT_DIR)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.isdir(export_path):
+        raise HTTPException(status_code=404, detail="Export directory not found")
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(export_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", export_path])
+        else:
+            subprocess.Popen(["xdg-open", export_path])
+    except Exception as e:
+        logger.error(f"open export folder error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {"status": "opened", "path": export_path}
 
 
 @app.get("/api/exports/{filename}")

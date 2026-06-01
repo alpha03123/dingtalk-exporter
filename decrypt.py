@@ -1,13 +1,22 @@
 import os
 import shutil
-import subprocess
 import logging
 import time
 import tempfile
+import base64
+import hashlib
+import json
+
+from Crypto.Cipher import AES
 
 import config
 
 logger = logging.getLogger(__name__)
+
+PAGE_SIZE = 4096
+V3_PBKDF2_SALT = b"666DingTalk888"[:8]
+V3_PBKDF2_ITERATIONS = 1000
+V3_PBKDF2_KEYLEN = 32
 
 
 def copy_encrypted_db(retry_count=None, retry_delay=None):
@@ -20,6 +29,13 @@ def copy_encrypted_db(retry_count=None, retry_delay=None):
     temp_dir = tempfile.mkdtemp(prefix="dingtalk_encrypt_", dir=config.DECRYPTED_DIR)
     dest_db = os.path.join(temp_dir, "dingtalk_encrypted.db")
 
+    if not os.path.isfile(config.ENCRYPTED_DB):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise FileNotFoundError(
+            f"未找到钉钉加密数据库: {config.ENCRYPTED_DB}\n"
+            "请确认钉钉桌面客户端已登录，并检查自动检测到的数据目录是否正确。"
+        )
+
     # Files to copy: main db + wal + shm
     files_to_copy = [
         (config.ENCRYPTED_DB, dest_db),
@@ -29,10 +45,21 @@ def copy_encrypted_db(retry_count=None, retry_delay=None):
 
     for attempt in range(retry_count):
         try:
+            copied_files = []
             for src, dst in files_to_copy:
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
-            logger.info(f"Successfully copied encrypted database to {temp_dir}")
+                    copied_files.append(os.path.basename(src))
+
+            if not os.path.isfile(dest_db):
+                raise FileNotFoundError(
+                    f"复制失败，未能从 {config.ENCRYPTED_DB} 生成临时数据库文件。"
+                )
+
+            logger.info(
+                f"Successfully copied encrypted database to {temp_dir} "
+                f"(files: {', '.join(copied_files)})"
+            )
             return dest_db
         except (PermissionError, OSError) as e:
             logger.warning(f"Copy attempt {attempt + 1}/{retry_count} failed: {e}")
@@ -49,86 +76,115 @@ def copy_encrypted_db(retry_count=None, retry_delay=None):
     raise RuntimeError("Failed to copy encrypted database")
 
 
-def decrypt_database(encrypted_db_path=None, output_path=None):
-    """Decrypt the database using dingwave CLI tool."""
-    # Validate dingwave binary exists
-    if not os.path.isfile(config.DINGWAVE_PATH):
-        raise FileNotFoundError(
-            f"dingwave binary not found at: {config.DINGWAVE_PATH}\n"
-            f"Please download it from https://github.com/p1g3/dingwave/releases\n"
-            f"and place it in the tools/ directory.\n"
-            f"Expected: tools/dingwave.exe (Windows) or tools/dingwave (Linux/Mac)"
+def _generate_v2_key(user_uid):
+    md5_hex = hashlib.md5(user_uid.encode("utf-8")).hexdigest()
+    return md5_hex[:16].encode("ascii")
+
+
+def _load_v3_salt(data_dir):
+    config_path = os.path.join(data_dir, "user_config")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"未找到钉钉 V3 user_config 文件: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        encoded = f.read().strip()
+
+    try:
+        payload = base64.b64decode(encoded).decode("utf-8")
+        data = json.loads(payload)
+    except Exception as e:  # pragma: no cover - depends on local file shape
+        raise RuntimeError(f"解析钉钉 V3 user_config 失败: {e}") from e
+
+    salt = (data.get("salt") or "").strip()
+    if not salt:
+        raise RuntimeError("钉钉 V3 user_config 中缺少 salt 字段。")
+    return salt
+
+
+def _generate_v3_key(user_uid, data_dir):
+    salt = _load_v3_salt(data_dir)
+    pbkdf2_output = hashlib.pbkdf2_hmac(
+        "sha1",
+        (user_uid + salt).encode("utf-8"),
+        V3_PBKDF2_SALT,
+        V3_PBKDF2_ITERATIONS,
+        V3_PBKDF2_KEYLEN,
+    )
+    md5_hex = hashlib.md5(pbkdf2_output).hexdigest()
+    return md5_hex[:16].encode("ascii")
+
+
+def _build_database_key():
+    if config.DINGTALK_DATA_DIR.endswith("_v3"):
+        logger.info(f"Using native V3 decrypt key path for UID={config.USER_UID}")
+        return _generate_v3_key(config.USER_UID, config.DINGTALK_DATA_DIR)
+    logger.info(f"Using native V2 decrypt key path for UID={config.USER_UID}")
+    return _generate_v2_key(config.USER_UID)
+
+
+def _decrypt_page_in_place(block, page):
+    for offset in range(0, len(page), block.block_size):
+        page[offset:offset + block.block_size] = block.decrypt(
+            bytes(page[offset:offset + block.block_size])
         )
+
+
+def _decrypt_database_pages(input_path, output_path, key):
+    block = AES.new(key, AES.MODE_ECB)
+
+    with open(input_path, "rb") as src, open(output_path, "wb") as dst:
+        while True:
+            page = bytearray(src.read(PAGE_SIZE))
+            if not page:
+                break
+
+            if len(page) == PAGE_SIZE:
+                _decrypt_page_in_place(block, page)
+
+            dst.write(page)
+
+
+def _validate_decrypted_header(output_path):
+    with open(output_path, "rb") as f:
+        header = f.read(16)
+    if header != b"SQLite format 3\x00":
+        raise RuntimeError(
+            "解密失败：输出文件不是有效的 SQLite 数据库。"
+            "请确认自动识别到的 DingTalk UID 和数据目录是否正确。"
+        )
+
+
+def decrypt_database(encrypted_db_path=None, output_path=None):
+    """Decrypt the copied DingTalk database into a plain SQLite file."""
 
     if encrypted_db_path is None:
         encrypted_db_path = copy_encrypted_db()
     if output_path is None:
         output_path = config.DECRYPTED_DB_PATH
+    if not os.path.isfile(encrypted_db_path):
+        raise FileNotFoundError(f"待解密数据库不存在: {encrypted_db_path}")
+
+    # Remove any stale output file from earlier failed attempts.
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     logger.info(f"Starting decryption: {encrypted_db_path} -> {output_path}")
 
-    cmd = [
-        config.DINGWAVE_PATH,
-        "-d", encrypted_db_path,
-        "-k", config.USER_UID,
-        "-o", output_path,
-    ]
-
     try:
-        # dingwave decrypts the DB then starts a web server on port 8080 and never exits.
-        # So we use Popen, monitor for the output file, then kill the process.
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-
-        # Wait for the output file to appear (dingwave decrypts first, then starts server)
-        max_wait = 300  # 5 minutes
-        check_interval = 1
-        waited = 0
-        while waited < max_wait:
-            # Check if output file exists and is not being written to
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                # Wait a bit more to ensure write is complete
-                time.sleep(2)
-                if os.path.exists(output_path):
-                    break
-            time.sleep(check_interval)
-            waited += check_interval
-
-        # Kill the dingwave process (it's blocking on its web server)
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            logger.info("dingwave process terminated after decryption")
-
-        # Log any output
-        if proc.stdout:
-            output = proc.stdout.read()
-            for line in output.strip().split("\n"):
-                if line.strip():
-                    logger.info(f"dingwave: {line.strip()}")
-
-        if not os.path.exists(output_path):
-            raise RuntimeError(f"Decryption failed: output file not created at {output_path}")
+        key = _build_database_key()
+        _decrypt_database_pages(encrypted_db_path, output_path, key)
+        _validate_decrypted_header(output_path)
 
         output_size = os.path.getsize(output_path)
+        if output_size <= 0:
+            raise RuntimeError(
+                "Decryption failed: output database is empty. "
+                "Please verify the detected DingTalk data directory and UID."
+            )
         logger.info(f"Decryption complete. Output size: {output_size / 1024 / 1024:.1f} MB")
 
         return output_path
 
-    except Exception:
-        # Make sure process is dead on error
-        if 'proc' in locals() and proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        raise
     finally:
         # Clean up the encrypted copy
         if encrypted_db_path and os.path.dirname(encrypted_db_path) != config.ENCRYPTED_DB_DIR:

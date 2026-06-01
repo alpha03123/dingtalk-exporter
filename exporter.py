@@ -286,7 +286,7 @@ def _format_file_size(size):
     return f"{size:.1f}TB"
 
 
-def export_by_cids(cids, base_dir=None, batch_size=500, since_time=None):
+def export_by_cids(cids, base_dir=None, batch_size=500, since_time=None, until_time=None):
     """Export only the selected conversations by cid list, with attachments.
 
     Args:
@@ -328,7 +328,7 @@ def export_by_cids(cids, base_dir=None, batch_size=500, since_time=None):
 
         offset = 0
         while True:
-            result = get_messages(conn, cid, limit=batch_size, offset=offset, since_time=since_time)
+            result = get_messages(conn, cid, limit=batch_size, offset=offset, since_time=since_time, until_time=until_time)
             all_raw_messages.extend(result["messages"])
             if offset + batch_size >= result["total"]:
                 break
