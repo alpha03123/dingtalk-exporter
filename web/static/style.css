@@ -436,6 +436,7 @@ body {
     align-items: center;
     padding: 10px 0;
     border-bottom: 1px solid var(--border);
+    gap: 12px;
 }
 .export-item:last-child { border-bottom: none; }
 .export-name { font-weight: 500; }
@@ -445,19 +446,44 @@ body {
     text-decoration: none;
     font-size: 13px;
 }
-
-.export-size[href] {
-    color: var(--primary);
-    text-decoration: none;
-}
 .export-size[href]:hover {
     text-decoration: underline;
 }
+.export-meta {
+    font-size: 12px;
+    color: var(--text-light);
+}
 .export-time { font-size: 12px; color: var(--text-light); }
+.export-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
+}
 .export-download {
     color: var(--primary);
     text-decoration: none;
     font-size: 13px;
+}
+.export-download:hover {
+    text-decoration: underline;
+}
+.export-delete {
+    border: none;
+    background: none;
+    color: #d64545;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0;
+}
+.export-delete:hover {
+    text-decoration: underline;
+}
+.export-delete:disabled {
+    color: #caa;
+    cursor: default;
+    text-decoration: none;
 }
 
 /* Export tabs */

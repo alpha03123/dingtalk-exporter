@@ -1,6 +1,8 @@
 import os
 import logging
 import subprocess
+import shutil
+import stat
 import sys
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
+from log_utils import log_event
 from parser import (
     DatabaseNotReadyError,
     get_connection,
@@ -35,6 +38,19 @@ app.add_middleware(
 _scheduler = None
 
 
+def _remove_readonly(func, path, exc_info):
+    """Retry removal after clearing the read-only flag on Windows exports."""
+    exc = exc_info[1]
+    if not isinstance(exc, PermissionError):
+        raise exc
+
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        raise exc
+
+
 def _query_db(callback):
     """Run a callback with a validated database connection."""
     try:
@@ -53,7 +69,7 @@ async def startup():
     global _scheduler
     _scheduler = setup_scheduler(app)
     _scheduler.start()
-    logger.info("Scheduler started")
+    log_event(logger, "info", "api.startup_completed")
 
 
 @app.on_event("shutdown")
@@ -61,7 +77,7 @@ async def shutdown():
     global _scheduler
     if _scheduler:
         _scheduler.shutdown()
-        logger.info("Scheduler stopped")
+        log_event(logger, "info", "api.shutdown_completed")
 
 
 # --- Static files ---
@@ -140,6 +156,8 @@ async def api_sync_status():
     db_status = get_database_status()
     state["database_ready"] = db_status["ready"]
     state["database_error"] = db_status["error"]
+    state["database"] = db_status
+    state["runtime"] = config.get_runtime_diagnostics()
     return state
 
 
@@ -309,10 +327,35 @@ async def api_export_open_folder(name: str):
         else:
             subprocess.Popen(["xdg-open", export_path])
     except Exception as e:
-        logger.error(f"open export folder error: {e}", exc_info=True)
+        log_event(logger, "error", "api.open_export_folder_failed", path=export_path, error=e)
+        logger.error("api.open_export_folder_failed_traceback", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     return {"status": "opened", "path": export_path}
+
+
+@app.delete("/api/exports/{name}")
+async def api_delete_export(name: str):
+    """Delete an exported directory or legacy export file."""
+    export_path = os.path.join(config.EXPORT_DIR, name)
+    export_path = os.path.normpath(export_path)
+    if not export_path.startswith(os.path.normpath(config.EXPORT_DIR)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.exists(export_path):
+        raise HTTPException(status_code=404, detail="Export not found")
+
+    try:
+        if os.path.isdir(export_path):
+            shutil.rmtree(export_path, onerror=_remove_readonly)
+        else:
+            os.chmod(export_path, stat.S_IWRITE)
+            os.remove(export_path)
+    except Exception as e:
+        log_event(logger, "error", "api.delete_export_failed", path=export_path, error=e)
+        logger.error("api.delete_export_failed_traceback", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {"status": "deleted", "name": name}
 
 
 @app.get("/api/exports/{filename}")
@@ -332,7 +375,7 @@ async def api_list_exports():
     """List all exports (directories and legacy JSON files)."""
     exports = []
     if os.path.isdir(config.EXPORT_DIR):
-        for f in sorted(os.listdir(config.EXPORT_DIR), reverse=True):
+        for f in os.listdir(config.EXPORT_DIR):
             fp = os.path.join(config.EXPORT_DIR, f)
             if f == "latest.json":
                 continue
@@ -356,4 +399,5 @@ async def api_list_exports():
                     "modified": os.path.getmtime(fp),
                     "download_url": f"/api/exports/{f}",
                 })
+    exports.sort(key=lambda item: item["modified"], reverse=True)
     return {"exports": exports}

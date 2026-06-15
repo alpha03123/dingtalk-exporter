@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 import config
+from log_utils import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,34 @@ MSG_TYPE_VIDEO_CALL = 1101
 
 class DatabaseNotReadyError(RuntimeError):
     """Raised when the decrypted DingTalk database is missing or unusable."""
+
+
+def _invalid_database_error_message():
+    return (
+        "解密后的聊天数据库无效或已损坏，请重新点击“手动同步”完成一次新的解密。"
+    )
+
+
+def _get_db_file_info(db_path):
+    info = {
+        "path": db_path,
+        "exists": os.path.isfile(db_path),
+        "size": None,
+        "header_hex": None,
+        "header_ascii": None,
+    }
+    if not info["exists"]:
+        return info
+
+    try:
+        info["size"] = os.path.getsize(db_path)
+        with open(db_path, "rb") as f:
+            header = f.read(16)
+        info["header_hex"] = header.hex()
+        info["header_ascii"] = "".join(chr(b) if 32 <= b <= 126 else "." for b in header)
+    except OSError as exc:
+        log_event(logger, "warning", "parser.db_inspect_failed", path=db_path, error=exc)
+    return info
 
 
 def _validate_database_schema(conn):
@@ -55,26 +84,40 @@ def get_connection(db_path=None):
         raise DatabaseNotReadyError(
             "未找到解密后的聊天数据库，请先点击“手动同步”完成首次解密。"
         )
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = None
     try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         _validate_database_schema(conn)
+    except sqlite3.Error as exc:
+        if conn is not None:
+            conn.close()
+        log_event(logger, "warning", "parser.db_not_usable", path=db_path, error=exc)
+        raise DatabaseNotReadyError(_invalid_database_error_message()) from exc
     except DatabaseNotReadyError:
-        conn.close()
+        if conn is not None:
+            conn.close()
         raise
     return conn
 
 
 def get_database_status(db_path=None):
     """Return whether the decrypted database is ready for queries."""
+    if db_path is None:
+        db_path = config.DECRYPTED_DB_PATH
+    info = _get_db_file_info(db_path)
     try:
         conn = get_connection(db_path)
     except DatabaseNotReadyError as exc:
-        return {"ready": False, "error": str(exc)}
+        info["ready"] = False
+        info["error"] = str(exc)
+        return info
     else:
         conn.close()
-        return {"ready": True, "error": None}
+        info["ready"] = True
+        info["error"] = None
+        return info
 
 
 def get_conversations(conn, limit=100, offset=0, keyword=None):

@@ -10,6 +10,7 @@ import json
 from Crypto.Cipher import AES
 
 import config
+from log_utils import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +57,23 @@ def copy_encrypted_db(retry_count=None, retry_delay=None):
                     f"复制失败，未能从 {config.ENCRYPTED_DB} 生成临时数据库文件。"
                 )
 
-            logger.info(
-                f"Successfully copied encrypted database to {temp_dir} "
-                f"(files: {', '.join(copied_files)})"
+            log_event(
+                logger,
+                "info",
+                "decrypt.copy_succeeded",
+                temp_dir=temp_dir,
+                files=copied_files,
             )
             return dest_db
         except (PermissionError, OSError) as e:
-            logger.warning(f"Copy attempt {attempt + 1}/{retry_count} failed: {e}")
+            log_event(
+                logger,
+                "warning",
+                "decrypt.copy_retry_failed",
+                attempt=attempt + 1,
+                retry_count=retry_count,
+                error=e,
+            )
             if attempt < retry_count - 1:
                 time.sleep(retry_delay)
             else:
@@ -98,6 +109,14 @@ def _load_v3_salt(data_dir):
     salt = (data.get("salt") or "").strip()
     if not salt:
         raise RuntimeError("钉钉 V3 user_config 中缺少 salt 字段。")
+    log_event(
+        logger,
+        "info",
+        "decrypt.v3_user_config_loaded",
+        path=config_path,
+        salt_len=len(salt),
+        salt_prefix=salt[:6],
+    )
     return salt
 
 
@@ -116,9 +135,23 @@ def _generate_v3_key(user_uid, data_dir):
 
 def _build_database_key():
     if config.DINGTALK_DATA_DIR.endswith("_v3"):
-        logger.info(f"Using native V3 decrypt key path for UID={config.USER_UID}")
+        log_event(
+            logger,
+            "info",
+            "decrypt.mode_selected",
+            mode="v3",
+            uid_masked=config.get_runtime_diagnostics()["user_uid_masked"],
+            data_dir=config.DINGTALK_DATA_DIR,
+        )
         return _generate_v3_key(config.USER_UID, config.DINGTALK_DATA_DIR)
-    logger.info(f"Using native V2 decrypt key path for UID={config.USER_UID}")
+    log_event(
+        logger,
+        "info",
+        "decrypt.mode_selected",
+        mode="v2",
+        uid_masked=config.get_runtime_diagnostics()["user_uid_masked"],
+        data_dir=config.DINGTALK_DATA_DIR,
+    )
     return _generate_v2_key(config.USER_UID)
 
 
@@ -148,6 +181,14 @@ def _validate_decrypted_header(output_path):
     with open(output_path, "rb") as f:
         header = f.read(16)
     if header != b"SQLite format 3\x00":
+        log_event(
+            logger,
+            "warning",
+            "decrypt.header_mismatch",
+            path=output_path,
+            header_hex=header.hex(),
+            header_ascii="".join(chr(b) if 32 <= b <= 126 else "." for b in header),
+        )
         raise RuntimeError(
             "解密失败：输出文件不是有效的 SQLite 数据库。"
             "请确认自动识别到的 DingTalk UID 和数据目录是否正确。"
@@ -168,7 +209,15 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
     if os.path.exists(output_path):
         os.remove(output_path)
 
-    logger.info(f"Starting decryption: {encrypted_db_path} -> {output_path}")
+    log_event(
+        logger,
+        "info",
+        "decrypt.started",
+        source_db=encrypted_db_path,
+        target_db=output_path,
+        source_size_mb=round(os.path.getsize(encrypted_db_path) / 1024 / 1024, 1),
+        mode="v3" if config.DINGTALK_DATA_DIR.endswith("_v3") else "v2",
+    )
 
     try:
         key = _build_database_key()
@@ -181,7 +230,13 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
                 "Decryption failed: output database is empty. "
                 "Please verify the detected DingTalk data directory and UID."
             )
-        logger.info(f"Decryption complete. Output size: {output_size / 1024 / 1024:.1f} MB")
+        log_event(
+            logger,
+            "info",
+            "decrypt.completed",
+            output_db=output_path,
+            output_size_mb=round(output_size / 1024 / 1024, 1),
+        )
 
         return output_path
 
@@ -190,15 +245,15 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
         if encrypted_db_path and os.path.dirname(encrypted_db_path) != config.ENCRYPTED_DB_DIR:
             temp_dir = os.path.dirname(encrypted_db_path)
             shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.info(f"Cleaned up temp directory: {temp_dir}")
+            log_event(logger, "info", "decrypt.temp_dir_cleaned", path=temp_dir)
 
 
 def sync_decrypt():
     """Full sync: copy encrypted DB, decrypt, return path to decrypted DB."""
-    logger.info("=== Starting sync decrypt ===")
+    log_event(logger, "info", "decrypt.sync_started")
     encrypted_copy = copy_encrypted_db()
     decrypted_path = decrypt_database(encrypted_copy)
-    logger.info("=== Sync decrypt complete ===")
+    log_event(logger, "info", "decrypt.sync_completed", output_db=decrypted_path)
     return decrypted_path
 
 

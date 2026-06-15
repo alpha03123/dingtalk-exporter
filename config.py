@@ -2,10 +2,50 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime
+from log_utils import log_event
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 logger = logging.getLogger(__name__)
+
+RUNTIME_DIAGNOSTICS = {
+    "config_source": None,
+    "env_override_uid": False,
+    "env_override_data_dir": False,
+    "partial_env_override": False,
+    "redirect_file": None,
+    "redirected_bases": [],
+    "search_bases": [],
+    "candidates": [],
+    "selected_candidate": None,
+}
+
+
+def _mask_uid(uid):
+    uid = str(uid or "")
+    if not uid or uid == "<YOUR_UID>":
+        return uid
+    if len(uid) <= 4:
+        return uid
+    return f"{'*' * (len(uid) - 4)}{uid[-4:]}"
+
+
+def _iso_mtime(timestamp):
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def _record_candidate(uid, path, mtime, version, uid_source="folder_name", log_matches=0):
+    RUNTIME_DIAGNOSTICS["candidates"].append(
+        {
+            "uid_masked": _mask_uid(uid),
+            "path": os.path.normpath(path),
+            "version": version,
+            "uid_source": uid_source,
+            "log_matches": log_matches,
+            "db_modified_at": _iso_mtime(mtime),
+        }
+    )
 
 
 def _load_redirected_dingtalk_bases():
@@ -16,6 +56,7 @@ def _load_redirected_dingtalk_bases():
         return bases
 
     redirect_file = os.path.join(appdata, "DingTalk", "redirectAppData.dat")
+    RUNTIME_DIAGNOSTICS["redirect_file"] = redirect_file
     if not os.path.isfile(redirect_file):
         return bases
 
@@ -23,12 +64,14 @@ def _load_redirected_dingtalk_bases():
         with open(redirect_file, "r", encoding="utf-8") as f:
             redirected = f.read().strip().strip("\x00")
     except OSError as e:
-        logger.warning(f"Failed to read DingTalk redirect file {redirect_file}: {e}")
+        log_event(logger, "warning", "config.redirect_read_failed", path=redirect_file, error=e)
         return bases
 
     if redirected and os.path.isdir(redirected):
-        bases.append(os.path.normpath(redirected))
-        logger.info(f"Detected redirected DingTalk data dir: {redirected}")
+        redirected = os.path.normpath(redirected)
+        bases.append(redirected)
+        RUNTIME_DIAGNOSTICS["redirected_bases"].append(redirected)
+        log_event(logger, "info", "config.redirect_detected", path=redirected)
 
     return bases
 
@@ -42,7 +85,7 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
     base_dir = os.path.dirname(os.path.normpath(data_dir))
     log_dir = os.path.join(base_dir, "log")
     if not os.path.isdir(log_dir):
-        return fallback_uid
+        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
 
     patterns = [
         re.compile(r"uid=(\d{10})"),
@@ -57,8 +100,8 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
             if name.startswith(("cef_debug.log", "gaea.log"))
         )[-12:]
     except OSError as e:
-        logger.warning(f"Failed to inspect DingTalk log dir {log_dir}: {e}")
-        return fallback_uid
+        log_event(logger, "warning", "config.v3_log_scan_failed", path=log_dir, error=e)
+        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
 
     for name in log_names:
         path = os.path.join(log_dir, name)
@@ -74,12 +117,20 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
                 scores[uid] = scores.get(uid, 0) + 1
 
     if not scores:
-        return fallback_uid
+        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
 
-    uid, _ = max(scores.items(), key=lambda item: (item[1], item[0]))
+    uid, match_count = max(scores.items(), key=lambda item: (item[1], item[0]))
     if uid != fallback_uid:
-        logger.info(f"Resolved DingTalk V3 numeric UID from logs: {uid}")
-    return uid
+        log_event(
+            logger,
+            "info",
+            "config.v3_uid_resolved",
+            path=data_dir,
+            uid_masked=_mask_uid(uid),
+            fallback_uid_masked=_mask_uid(fallback_uid),
+            matches=match_count,
+        )
+    return uid, {"uid_source": "log_scan", "log_matches": match_count}
 
 
 def _detect_dingtalk_user():
@@ -95,10 +146,34 @@ def _detect_dingtalk_user():
     # Environment variables take highest priority
     env_uid = os.environ.get("DINGTALK_UID", "").strip()
     env_dir = os.environ.get("DINGTALK_DATA_DIR", "").strip()
+    RUNTIME_DIAGNOSTICS["env_override_uid"] = bool(env_uid)
+    RUNTIME_DIAGNOSTICS["env_override_data_dir"] = bool(env_dir)
+    RUNTIME_DIAGNOSTICS["partial_env_override"] = bool(env_uid) ^ bool(env_dir)
 
     if env_uid and env_dir:
-        logger.info(f"Using config from environment: UID={env_uid}")
+        log_event(
+            logger,
+            "info",
+            "config.source_environment",
+            uid_masked=_mask_uid(env_uid),
+            path=env_dir,
+        )
+        RUNTIME_DIAGNOSTICS["config_source"] = "environment"
+        RUNTIME_DIAGNOSTICS["selected_candidate"] = {
+            "uid_masked": _mask_uid(env_uid),
+            "path": os.path.normpath(env_dir),
+            "version": "v3" if env_dir.endswith("_v3") else "v2",
+            "uid_source": "environment",
+        }
         return env_dir, env_uid
+    if RUNTIME_DIAGNOSTICS["partial_env_override"]:
+        log_event(
+            logger,
+            "warning",
+            "config.partial_environment_override",
+            env_uid_set=bool(env_uid),
+            env_dir_set=bool(env_dir),
+        )
 
     # Multiple possible DingTalk base directories (ordered by likelihood)
     search_bases = []
@@ -133,6 +208,7 @@ def _detect_dingtalk_user():
             seen.add(b_norm)
             unique_bases.append(b)
     search_bases = unique_bases
+    RUNTIME_DIAGNOSTICS["search_bases"] = [os.path.normpath(b) for b in search_bases]
 
     # Find all *_v2 / *_v3 user directories that have a database file
     v2_dirs = []
@@ -146,9 +222,18 @@ def _detect_dingtalk_user():
                     db_file = os.path.join(full_path, "DBFiles", "dingtalk.db")
                     if os.path.exists(db_file):
                         uid = entry.rsplit("_v", 1)[0]
+                        uid_meta = {"uid_source": "folder_name", "log_matches": 0}
                         if entry.endswith("_v3"):
-                            uid = _detect_v3_numeric_uid(full_path, uid)
+                            uid, uid_meta = _detect_v3_numeric_uid(full_path, uid)
                         mtime = os.path.getmtime(db_file)
+                        _record_candidate(
+                            uid=uid,
+                            path=full_path,
+                            mtime=mtime,
+                            version="v3" if entry.endswith("_v3") else "v2",
+                            uid_source=uid_meta["uid_source"],
+                            log_matches=uid_meta["log_matches"],
+                        )
                         v2_dirs.append((uid, full_path, mtime))
 
     if not v2_dirs:
@@ -156,18 +241,60 @@ def _detect_dingtalk_user():
 
     if len(v2_dirs) == 1:
         uid, path, _ = v2_dirs[0]
-        logger.info(f"Auto-detected DingTalk user: UID={uid}")
+        log_event(
+            logger,
+            "info",
+            "config.auto_detected",
+            uid_masked=_mask_uid(uid),
+            path=path,
+            candidates=len(v2_dirs),
+        )
+        RUNTIME_DIAGNOSTICS["config_source"] = "auto_detected"
+        RUNTIME_DIAGNOSTICS["selected_candidate"] = {
+            "uid_masked": _mask_uid(uid),
+            "path": os.path.normpath(path),
+            "version": "v3" if path.endswith("_v3") else "v2",
+            "uid_source": next(
+                (
+                    item["uid_source"]
+                    for item in RUNTIME_DIAGNOSTICS["candidates"]
+                    if item["path"] == os.path.normpath(path)
+                ),
+                "folder_name",
+            ),
+        }
         return path, uid
 
     # Multiple users: pick the one with most recently modified database
     v2_dirs.sort(key=lambda x: x[2], reverse=True)
     uid, path, _ = v2_dirs[0]
     all_uids = [f"  UID={u} (path={p})" for u, p, _ in v2_dirs]
-    logger.warning(
-        f"Multiple DingTalk users found, using the most recent (UID={uid}):\n"
-        + "\n".join(all_uids)
-        + "\nTo use a different user, set DINGTALK_UID and DINGTALK_DATA_DIR environment variables."
+    log_event(
+        logger,
+        "warning",
+        "config.multiple_users_detected",
+        selected_uid_masked=_mask_uid(uid),
+        selected_path=path,
+        candidates=[
+            {"uid_masked": _mask_uid(u), "path": p}
+            for u, p, _ in v2_dirs
+        ],
     )
+    RUNTIME_DIAGNOSTICS["config_source"] = "auto_detected"
+    RUNTIME_DIAGNOSTICS["selected_candidate"] = {
+        "uid_masked": _mask_uid(uid),
+        "path": os.path.normpath(path),
+        "version": "v3" if path.endswith("_v3") else "v2",
+        "uid_source": next(
+            (
+                item["uid_source"]
+                for item in RUNTIME_DIAGNOSTICS["candidates"]
+                if item["path"] == os.path.normpath(path)
+            ),
+            "folder_name",
+        ),
+        "selection_reason": "latest_db_mtime",
+    }
     return path, uid
 
 
@@ -199,7 +326,7 @@ def _detect_dingwave():
             if "dingwave" in lower and not lower.endswith((".md", ".txt", ".zip", ".tar", ".gz")):
                 full = os.path.join(tools_dir, f)
                 if os.path.isfile(full):
-                    logger.info(f"Found dingwave binary: {f}")
+                    log_event(logger, "info", "config.dingwave_detected", path=full, filename=f)
                     return full
 
     # Return default (will fail later with clear message)
@@ -219,6 +346,15 @@ _detected_dir, _detected_uid = _detect_dingtalk_user()
 
 DINGTALK_DATA_DIR = _detected_dir or r"C:\Users\<YOUR_USERNAME>\AppData\Roaming\DingTalk\<YOUR_UID>_v2"
 USER_UID = _detected_uid or "<YOUR_UID>"
+
+if not _detected_dir:
+    RUNTIME_DIAGNOSTICS["config_source"] = "manual_fallback"
+    RUNTIME_DIAGNOSTICS["selected_candidate"] = {
+        "uid_masked": _mask_uid(USER_UID),
+        "path": os.path.normpath(DINGTALK_DATA_DIR),
+        "version": "v3" if DINGTALK_DATA_DIR.endswith("_v3") else "v2",
+        "uid_source": "manual_default",
+    }
 
 ENCRYPTED_DB_DIR = os.path.join(DINGTALK_DATA_DIR, "DBFiles")
 ENCRYPTED_DB = os.path.join(ENCRYPTED_DB_DIR, "dingtalk.db")
@@ -290,6 +426,26 @@ CONTENT_TYPE_NAMES = {
 # WEB_HOST = "0.0.0.0"
 WEB_HOST = "localhost"
 WEB_PORT = 8090
+
+
+def get_runtime_diagnostics():
+    return {
+        "config_source": RUNTIME_DIAGNOSTICS["config_source"],
+        "env_override_uid": RUNTIME_DIAGNOSTICS["env_override_uid"],
+        "env_override_data_dir": RUNTIME_DIAGNOSTICS["env_override_data_dir"],
+        "partial_env_override": RUNTIME_DIAGNOSTICS["partial_env_override"],
+        "redirect_file": RUNTIME_DIAGNOSTICS["redirect_file"],
+        "redirected_bases": list(RUNTIME_DIAGNOSTICS["redirected_bases"]),
+        "search_bases": list(RUNTIME_DIAGNOSTICS["search_bases"]),
+        "candidate_count": len(RUNTIME_DIAGNOSTICS["candidates"]),
+        "candidates": list(RUNTIME_DIAGNOSTICS["candidates"]),
+        "selected_candidate": dict(RUNTIME_DIAGNOSTICS["selected_candidate"] or {}),
+        "dingtalk_data_dir": os.path.normpath(DINGTALK_DATA_DIR),
+        "encrypted_db": os.path.normpath(ENCRYPTED_DB),
+        "decrypted_db": os.path.normpath(DECRYPTED_DB_PATH),
+        "user_uid_masked": _mask_uid(USER_UID),
+        "is_v3": DINGTALK_DATA_DIR.endswith("_v3"),
+    }
 
 # Ensure directories exist
 for d in [DATA_DIR, DECRYPTED_DIR, EXPORT_DIR, LOGS_DIR]:

@@ -541,15 +541,18 @@ async function loadExports() {
         const dlUrl = exp.download_url || `/api/exports/${encodeURIComponent(exp.filename)}`;
         const folderLinkHtml = isDir
             ? `<a class="export-size js-open-export-folder" href="#" data-name="${escapeHtml(exp.filename)}">目录</a>`
-            : `<span class="export-size">${formatSize(exp.size)}</span>`;
-        const actionHtml = `<a class="export-download" href="${dlUrl}" download>下载</a>`;
+            : `<span class="export-meta">${formatSize(exp.size)}</span>`;
+        const actionHtml = `
+            <a class="export-download" href="${dlUrl}" download>下载</a>
+            <button class="export-delete js-delete-export" type="button" data-name="${escapeHtml(exp.filename)}">删除</button>
+        `;
         return `
         <div class="export-item">
             <div>
                 <div class="export-name">${badge}${escapeHtml(exp.filename)}</div>
                 <div class="export-time">${formatTime(exp.modified * 1000)}</div>
             </div>
-            <div>
+            <div class="export-actions">
                 ${folderLinkHtml}
                 ${actionHtml}
             </div>
@@ -571,6 +574,30 @@ async function loadExports() {
                 }
             } catch (err) {
                 alert('打开导出文件夹失败: ' + err.message);
+            }
+        });
+    });
+
+    list.querySelectorAll('.js-delete-export').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            if (!confirm(`确认删除导出项“${name}”吗？`)) {
+                return;
+            }
+
+            btn.disabled = true;
+            try {
+                const resp = await fetch(`/api/exports/${encodeURIComponent(name)}`, {
+                    method: 'DELETE',
+                });
+                if (!resp.ok) {
+                    const payload = await resp.json().catch(() => ({}));
+                    throw new Error(payload.detail || `HTTP ${resp.status}`);
+                }
+                await loadExports();
+            } catch (err) {
+                btn.disabled = false;
+                alert('删除导出项失败: ' + err.message);
             }
         });
     });

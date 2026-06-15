@@ -6,6 +6,7 @@ from datetime import datetime
 import config
 from decrypt import sync_decrypt
 from exporter import export_incremental
+from log_utils import log_event
 from parser import get_connection, get_latest_message_time
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ def _load_state():
                 saved = json.load(f)
                 _sync_state.update(saved)
         except (json.JSONDecodeError, IOError) as e:
-            logger.warning(f"Failed to load sync state: {e}")
+            log_event(logger, "warning", "scheduler.state_load_failed", path=config.SYNC_STATE_FILE, error=e)
 
 
 def _save_state():
@@ -40,7 +41,7 @@ def _save_state():
         with open(config.SYNC_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(_sync_state, f, ensure_ascii=False, indent=2)
     except IOError as e:
-        logger.warning(f"Failed to save sync state: {e}")
+        log_event(logger, "warning", "scheduler.state_save_failed", path=config.SYNC_STATE_FILE, error=e)
 
 
 def get_sync_state():
@@ -53,7 +54,7 @@ def do_sync(full=False):
     global _sync_state
 
     if _sync_state["is_syncing"]:
-        logger.warning("Sync already in progress, skipping")
+        log_event(logger, "warning", "scheduler.sync_skipped", reason="already_in_progress")
         return False
 
     _sync_state["is_syncing"] = True
@@ -61,11 +62,11 @@ def do_sync(full=False):
     _save_state()
 
     try:
-        logger.info("=== Starting sync cycle ===")
+        log_event(logger, "info", "scheduler.sync_started", full=full)
 
         # Step 1: Decrypt
         decrypted_path = sync_decrypt()
-        logger.info(f"Database decrypted: {decrypted_path}")
+        log_event(logger, "info", "scheduler.decrypt_ready", path=decrypted_path)
 
         # Step 2: Get latest message time
         conn = get_connection(decrypted_path)
@@ -74,14 +75,14 @@ def do_sync(full=False):
             # Full export on first run or when requested
             from exporter import export_all
             export_path = export_all()
-            logger.info(f"Full export complete: {export_path}")
+            log_event(logger, "info", "scheduler.export_completed", mode="full", path=export_path)
         else:
             # Incremental export
             export_path = export_incremental(_sync_state["last_sync_time"])
             if export_path:
-                logger.info(f"Incremental export complete: {export_path}")
+                log_event(logger, "info", "scheduler.export_completed", mode="incremental", path=export_path)
             else:
-                logger.info("No new messages for incremental export")
+                log_event(logger, "info", "scheduler.export_skipped", reason="no_new_messages")
 
         # Step 3: Update sync state
         latest_time = get_latest_message_time(conn)
@@ -94,11 +95,19 @@ def do_sync(full=False):
         _sync_state["is_syncing"] = False
 
         _save_state()
-        logger.info(f"=== Sync cycle complete (#{_sync_state['sync_count']}) ===")
+        log_event(
+            logger,
+            "info",
+            "scheduler.sync_completed",
+            sync_count=_sync_state["sync_count"],
+            last_sync_time=_sync_state["last_sync_time"],
+            export_path=export_path,
+        )
         return True
 
     except Exception as e:
-        logger.error(f"Sync failed: {e}", exc_info=True)
+        log_event(logger, "error", "scheduler.sync_failed", error=e)
+        logger.error("scheduler.sync_failed_traceback", exc_info=True)
         _sync_state["is_syncing"] = False
         _sync_state["last_error"] = str(e)
         _save_state()
@@ -126,7 +135,13 @@ def setup_scheduler(app=None):
     # Calculate next run time
     _sync_state["next_sync_time"] = "every {} hours".format(config.SYNC_INTERVAL_HOURS)
 
-    logger.info(f"Scheduler configured: sync every {config.SYNC_INTERVAL_HOURS} hours")
+    log_event(
+        logger,
+        "info",
+        "scheduler.configured",
+        interval_hours=config.SYNC_INTERVAL_HOURS,
+        next_sync_time=_sync_state["next_sync_time"],
+    )
 
     return scheduler
 
