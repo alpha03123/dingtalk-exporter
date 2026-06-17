@@ -19,6 +19,8 @@ RUNTIME_DIAGNOSTICS = {
     "search_bases": [],
     "candidates": [],
     "selected_candidate": None,
+    "selected_decrypt_uid_candidates": [],
+    "candidate_decrypt_uid_candidates": {},
 }
 
 
@@ -35,17 +37,97 @@ def _iso_mtime(timestamp):
     return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
 
 
-def _record_candidate(uid, path, mtime, version, uid_source="folder_name", log_matches=0):
+def _dedupe_keep_order(values):
+    result = []
+    seen = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _masked_uid_list(values):
+    return [_mask_uid(value) for value in values]
+
+
+def _record_candidate(
+    uid,
+    path,
+    mtime,
+    version,
+    uid_source="folder_name",
+    log_matches=0,
+    decrypt_uid_candidates=None,
+    uid_source_log=None,
+):
+    normalized_path = os.path.normpath(path)
+    decrypt_uid_candidates = _dedupe_keep_order(decrypt_uid_candidates or [uid])
+    RUNTIME_DIAGNOSTICS["candidate_decrypt_uid_candidates"][normalized_path] = decrypt_uid_candidates
     RUNTIME_DIAGNOSTICS["candidates"].append(
         {
             "uid_masked": _mask_uid(uid),
-            "path": os.path.normpath(path),
+            "path": normalized_path,
             "version": version,
             "uid_source": uid_source,
+            "uid_source_log": uid_source_log,
             "log_matches": log_matches,
             "db_modified_at": _iso_mtime(mtime),
+            "decrypt_uid_candidates_masked": _masked_uid_list(decrypt_uid_candidates),
         }
     )
+
+
+def _get_candidate_info_by_path(path):
+    normalized_path = os.path.normpath(path)
+    for item in RUNTIME_DIAGNOSTICS["candidates"]:
+        if item["path"] == normalized_path:
+            return item
+    return None
+
+
+def _get_candidate_decrypt_uid_candidates(path, default_uid):
+    normalized_path = os.path.normpath(path)
+    return list(
+        RUNTIME_DIAGNOSTICS["candidate_decrypt_uid_candidates"].get(
+            normalized_path,
+            [default_uid],
+        )
+    )
+
+
+def _set_selected_candidate(
+    uid,
+    path,
+    version,
+    uid_source,
+    decrypt_uid_candidates=None,
+    uid_source_log=None,
+    **extra,
+):
+    decrypt_uid_candidates = _dedupe_keep_order(decrypt_uid_candidates or [uid])
+    RUNTIME_DIAGNOSTICS["selected_decrypt_uid_candidates"] = decrypt_uid_candidates
+    selected = {
+        "uid_masked": _mask_uid(uid),
+        "path": os.path.normpath(path),
+        "version": version,
+        "uid_source": uid_source,
+        "uid_source_log": uid_source_log,
+        "decrypt_uid_candidates_masked": _masked_uid_list(decrypt_uid_candidates),
+    }
+    selected.update(extra)
+    RUNTIME_DIAGNOSTICS["selected_candidate"] = selected
+
+
+def _select_v3_log_names(log_dir):
+    names = os.listdir(log_dir)
+    cef_logs = sorted(name for name in names if name.startswith("cef_debug.log"))[-12:]
+    gaea_logs = sorted(name for name in names if name.startswith("gaea.log"))
+    selected = list(cef_logs)
+    if gaea_logs:
+        selected.append(gaea_logs[-1])
+    return selected
 
 
 def _load_redirected_dingtalk_bases():
@@ -85,24 +167,30 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
     base_dir = os.path.dirname(os.path.normpath(data_dir))
     log_dir = os.path.join(base_dir, "log")
     if not os.path.isdir(log_dir):
-        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
+        return fallback_uid, {
+            "uid_source": "folder_name",
+            "log_matches": 0,
+            "decrypt_uid_candidates": [fallback_uid],
+        }
 
-    token_pattern = r"([A-Za-z0-9]{6,64})"
     patterns = [
-        re.compile(rf"uid={token_pattern}"),
-        re.compile(rf"myOpenId={token_pattern}"),
-        re.compile(rf"cid={token_pattern}:"),
+        re.compile(r"&uid=(\d{10})"),
+        re.compile(r"real_uid=(\d{10})"),
+        re.compile(r"myOpenId=(\d{10})"),
+        re.compile(r"&cid=(\d{10}):"),
     ]
     scores = {}
+    uid_log_scores = {}
 
     try:
-        log_names = sorted(
-            name for name in os.listdir(log_dir)
-            if name.startswith(("cef_debug.log", "gaea.log"))
-        )[-12:]
+        log_names = _select_v3_log_names(log_dir)
     except OSError as e:
         log_event(logger, "warning", "config.v3_log_scan_failed", path=log_dir, error=e)
-        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
+        return fallback_uid, {
+            "uid_source": "folder_name",
+            "log_matches": 0,
+            "decrypt_uid_candidates": [fallback_uid],
+        }
 
     for name in log_names:
         path = os.path.join(log_dir, name)
@@ -112,15 +200,34 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
         except OSError:
             continue
 
+        score_uid = None
+        if name.startswith("gaea.log"):
+            real_uid_matches = patterns[1].findall(text)
+            if real_uid_matches:
+                real_uid_scores = {}
+                for real_uid in real_uid_matches:
+                    real_uid_scores[real_uid] = real_uid_scores.get(real_uid, 0) + 1
+                score_uid = max(real_uid_scores.items(), key=lambda item: (item[1], item[0]))[0]
+
         for pattern in patterns:
             for match in pattern.finditer(text):
-                uid = match.group(1)
+                uid = score_uid or match.group(1)
                 scores[uid] = scores.get(uid, 0) + 1
+                uid_log_scores.setdefault(uid, {})
+                uid_log_scores[uid][name] = uid_log_scores[uid].get(name, 0) + 1
 
     if not scores:
-        return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
+        return fallback_uid, {
+            "uid_source": "folder_name",
+            "log_matches": 0,
+            "decrypt_uid_candidates": [fallback_uid],
+        }
 
     uid, match_count = max(scores.items(), key=lambda item: (item[1], item[0]))
+    source_log = None
+    if uid in uid_log_scores and uid_log_scores[uid]:
+        source_log = max(uid_log_scores[uid].items(), key=lambda item: (item[1], item[0]))[0]
+    decrypt_uid_candidates = _dedupe_keep_order([uid, fallback_uid])
     if uid != fallback_uid:
         log_event(
             logger,
@@ -130,8 +237,15 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
             uid_masked=_mask_uid(uid),
             fallback_uid_masked=_mask_uid(fallback_uid),
             matches=match_count,
+            source_log=source_log,
+            decrypt_uid_candidates_masked=_masked_uid_list(decrypt_uid_candidates),
         )
-    return uid, {"uid_source": "log_scan", "log_matches": match_count}
+    return uid, {
+        "uid_source": "log_scan",
+        "uid_source_log": source_log,
+        "log_matches": match_count,
+        "decrypt_uid_candidates": decrypt_uid_candidates,
+    }
 
 
 def _detect_dingtalk_user():
@@ -160,12 +274,13 @@ def _detect_dingtalk_user():
             path=env_dir,
         )
         RUNTIME_DIAGNOSTICS["config_source"] = "environment"
-        RUNTIME_DIAGNOSTICS["selected_candidate"] = {
-            "uid_masked": _mask_uid(env_uid),
-            "path": os.path.normpath(env_dir),
-            "version": "v3" if env_dir.endswith("_v3") else "v2",
-            "uid_source": "environment",
-        }
+        _set_selected_candidate(
+            uid=env_uid,
+            path=env_dir,
+            version="v3" if env_dir.endswith("_v3") else "v2",
+            uid_source="environment",
+            decrypt_uid_candidates=[env_uid],
+        )
         return env_dir, env_uid
     if RUNTIME_DIAGNOSTICS["partial_env_override"]:
         log_event(
@@ -223,7 +338,11 @@ def _detect_dingtalk_user():
                     db_file = os.path.join(full_path, "DBFiles", "dingtalk.db")
                     if os.path.exists(db_file):
                         uid = entry.rsplit("_v", 1)[0]
-                        uid_meta = {"uid_source": "folder_name", "log_matches": 0}
+                        uid_meta = {
+                            "uid_source": "folder_name",
+                            "log_matches": 0,
+                            "decrypt_uid_candidates": [uid],
+                        }
                         if entry.endswith("_v3"):
                             uid, uid_meta = _detect_v3_numeric_uid(full_path, uid)
                         mtime = os.path.getmtime(db_file)
@@ -233,7 +352,9 @@ def _detect_dingtalk_user():
                             mtime=mtime,
                             version="v3" if entry.endswith("_v3") else "v2",
                             uid_source=uid_meta["uid_source"],
+                            uid_source_log=uid_meta.get("uid_source_log"),
                             log_matches=uid_meta["log_matches"],
+                            decrypt_uid_candidates=uid_meta["decrypt_uid_candidates"],
                         )
                         v2_dirs.append((uid, full_path, mtime))
 
@@ -251,19 +372,15 @@ def _detect_dingtalk_user():
             candidates=len(v2_dirs),
         )
         RUNTIME_DIAGNOSTICS["config_source"] = "auto_detected"
-        RUNTIME_DIAGNOSTICS["selected_candidate"] = {
-            "uid_masked": _mask_uid(uid),
-            "path": os.path.normpath(path),
-            "version": "v3" if path.endswith("_v3") else "v2",
-            "uid_source": next(
-                (
-                    item["uid_source"]
-                    for item in RUNTIME_DIAGNOSTICS["candidates"]
-                    if item["path"] == os.path.normpath(path)
-                ),
-                "folder_name",
-            ),
-        }
+        candidate_info = _get_candidate_info_by_path(path) or {}
+        _set_selected_candidate(
+            uid=uid,
+            path=path,
+            version="v3" if path.endswith("_v3") else "v2",
+            uid_source=candidate_info.get("uid_source", "folder_name"),
+            uid_source_log=candidate_info.get("uid_source_log"),
+            decrypt_uid_candidates=_get_candidate_decrypt_uid_candidates(path, uid),
+        )
         return path, uid
 
     # Multiple users: pick the one with most recently modified database
@@ -282,20 +399,16 @@ def _detect_dingtalk_user():
         ],
     )
     RUNTIME_DIAGNOSTICS["config_source"] = "auto_detected"
-    RUNTIME_DIAGNOSTICS["selected_candidate"] = {
-        "uid_masked": _mask_uid(uid),
-        "path": os.path.normpath(path),
-        "version": "v3" if path.endswith("_v3") else "v2",
-        "uid_source": next(
-            (
-                item["uid_source"]
-                for item in RUNTIME_DIAGNOSTICS["candidates"]
-                if item["path"] == os.path.normpath(path)
-            ),
-            "folder_name",
-        ),
-        "selection_reason": "latest_db_mtime",
-    }
+    candidate_info = _get_candidate_info_by_path(path) or {}
+    _set_selected_candidate(
+        uid=uid,
+        path=path,
+        version="v3" if path.endswith("_v3") else "v2",
+        uid_source=candidate_info.get("uid_source", "folder_name"),
+        uid_source_log=candidate_info.get("uid_source_log"),
+        decrypt_uid_candidates=_get_candidate_decrypt_uid_candidates(path, uid),
+        selection_reason="latest_db_mtime",
+    )
     return path, uid
 
 
@@ -350,12 +463,13 @@ USER_UID = _detected_uid or "<YOUR_UID>"
 
 if not _detected_dir:
     RUNTIME_DIAGNOSTICS["config_source"] = "manual_fallback"
-    RUNTIME_DIAGNOSTICS["selected_candidate"] = {
-        "uid_masked": _mask_uid(USER_UID),
-        "path": os.path.normpath(DINGTALK_DATA_DIR),
-        "version": "v3" if DINGTALK_DATA_DIR.endswith("_v3") else "v2",
-        "uid_source": "manual_default",
-    }
+    _set_selected_candidate(
+        uid=USER_UID,
+        path=DINGTALK_DATA_DIR,
+        version="v3" if DINGTALK_DATA_DIR.endswith("_v3") else "v2",
+        uid_source="manual_default",
+        decrypt_uid_candidates=[USER_UID],
+    )
 
 ENCRYPTED_DB_DIR = os.path.join(DINGTALK_DATA_DIR, "DBFiles")
 ENCRYPTED_DB = os.path.join(ENCRYPTED_DB_DIR, "dingtalk.db")
@@ -441,12 +555,19 @@ def get_runtime_diagnostics():
         "candidate_count": len(RUNTIME_DIAGNOSTICS["candidates"]),
         "candidates": list(RUNTIME_DIAGNOSTICS["candidates"]),
         "selected_candidate": dict(RUNTIME_DIAGNOSTICS["selected_candidate"] or {}),
+        "decrypt_uid_candidates_masked": _masked_uid_list(
+            RUNTIME_DIAGNOSTICS["selected_decrypt_uid_candidates"]
+        ),
         "dingtalk_data_dir": os.path.normpath(DINGTALK_DATA_DIR),
         "encrypted_db": os.path.normpath(ENCRYPTED_DB),
         "decrypted_db": os.path.normpath(DECRYPTED_DB_PATH),
         "user_uid_masked": _mask_uid(USER_UID),
         "is_v3": DINGTALK_DATA_DIR.endswith("_v3"),
     }
+
+
+def get_decrypt_uid_candidates():
+    return list(RUNTIME_DIAGNOSTICS["selected_decrypt_uid_candidates"] or [USER_UID])
 
 # Ensure directories exist
 for d in [DATA_DIR, DECRYPTED_DIR, EXPORT_DIR, LOGS_DIR]:

@@ -120,8 +120,9 @@ def _load_v3_salt(data_dir):
     return salt
 
 
-def _generate_v3_key(user_uid, data_dir):
-    salt = _load_v3_salt(data_dir)
+def _generate_v3_key(user_uid, data_dir, salt=None):
+    if salt is None:
+        salt = _load_v3_salt(data_dir)
     pbkdf2_output = hashlib.pbkdf2_hmac(
         "sha1",
         (user_uid + salt).encode("utf-8"),
@@ -133,17 +134,23 @@ def _generate_v3_key(user_uid, data_dir):
     return md5_hex[:16].encode("ascii")
 
 
-def _build_database_key():
+def _build_database_keys():
     if config.DINGTALK_DATA_DIR.endswith("_v3"):
+        uid_candidates = config.get_decrypt_uid_candidates()
         log_event(
             logger,
             "info",
             "decrypt.mode_selected",
             mode="v3",
             uid_masked=config.get_runtime_diagnostics()["user_uid_masked"],
+            uid_candidates_masked=[config._mask_uid(uid) for uid in uid_candidates],
             data_dir=config.DINGTALK_DATA_DIR,
         )
-        return _generate_v3_key(config.USER_UID, config.DINGTALK_DATA_DIR)
+        salt = _load_v3_salt(config.DINGTALK_DATA_DIR)
+        return [
+            (uid, _generate_v3_key(uid, config.DINGTALK_DATA_DIR, salt=salt))
+            for uid in uid_candidates
+        ]
     log_event(
         logger,
         "info",
@@ -152,7 +159,7 @@ def _build_database_key():
         uid_masked=config.get_runtime_diagnostics()["user_uid_masked"],
         data_dir=config.DINGTALK_DATA_DIR,
     )
-    return _generate_v2_key(config.USER_UID)
+    return [(config.USER_UID, _generate_v2_key(config.USER_UID))]
 
 
 def _decrypt_page_in_place(block, page):
@@ -220,9 +227,26 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
     )
 
     try:
-        key = _build_database_key()
-        _decrypt_database_pages(encrypted_db_path, output_path, key)
-        _validate_decrypted_header(output_path)
+        key_candidates = _build_database_keys()
+        last_error = None
+        for index, (key_uid, key) in enumerate(key_candidates):
+            try:
+                _decrypt_database_pages(encrypted_db_path, output_path, key)
+                _validate_decrypted_header(output_path)
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                if index >= len(key_candidates) - 1:
+                    raise
+                log_event(
+                    logger,
+                    "warning",
+                    "decrypt.uid_candidate_failed",
+                    uid_masked=config._mask_uid(key_uid),
+                    remaining_candidates=len(key_candidates) - index - 1,
+                )
+        if last_error and not os.path.exists(output_path):
+            raise last_error
 
         output_size = os.path.getsize(output_path)
         if output_size <= 0:

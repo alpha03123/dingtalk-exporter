@@ -43,6 +43,7 @@ if __name__ == "__main__":
         config_source=runtime_diag["config_source"],
         candidates=runtime_diag["candidate_count"],
         selected_uid_masked=runtime_diag["user_uid_masked"],
+        selected_uid_source_log=runtime_diag["selected_candidate"].get("uid_source_log"),
         is_v3=runtime_diag["is_v3"],
     )
     if runtime_diag["partial_env_override"]:

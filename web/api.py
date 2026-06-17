@@ -204,8 +204,7 @@ def _do_export_selected(cids, since_time=None, until_time=None):
         sched._sync_state["last_export_path"] = path
         sched._sync_state["sync_count"] += 1
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Selected export failed: {e}", exc_info=True)
+        logger.error(f"Selected export failed: {e}", exc_info=True)
         sched._sync_state["last_error"] = str(e)
     finally:
         sched._sync_state["is_syncing"] = False
@@ -263,7 +262,7 @@ async def api_local_file(path: str = Query(..., min_length=1)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"local-file error: {e}", exc_info=True)
+        log_event(logger, "error", "api.local_file_failed", path=path, error=e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
