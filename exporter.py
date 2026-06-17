@@ -437,4 +437,4 @@ if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     logging.basicConfig(level=logging.INFO)
     path = export_all()
-    print(f"Export saved to: {path}")
+    print(f"导出结果已保存到：{path}")

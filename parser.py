@@ -786,17 +786,17 @@ if __name__ == "__main__":
 
     conn = get_connection()
     stats = get_conversation_stats(conn)
-    print(f"Stats: {json.dumps(stats, ensure_ascii=False, indent=2)}")
+    print(f"统计信息：{json.dumps(stats, ensure_ascii=False, indent=2)}")
 
     convs = get_conversations(conn, limit=5)
-    print(f"\nTop 5 conversations:")
+    print("\n最近的 5 个会话：")
     for c in convs["conversations"]:
-        print(f"  [{c['type']}] {c['title']} (members: {c['member_count']}, last: {c.get('last_modify', 0)})")
+        print(f"  [{c['type']}] {c['title']}（成员数：{c['member_count']}，最后更新时间：{c.get('last_modify', 0)}）")
 
     if convs["conversations"]:
         cid = convs["conversations"][0]["cid"]
         msgs = get_messages(conn, cid, limit=3)
-        print(f"\nLatest 3 messages from '{convs['conversations'][0]['title']}':")
+        print(f"\n会话“{convs['conversations'][0]['title']}”的最近 3 条消息：")
         for m in msgs["messages"]:
             print(f"  [{m['created_at_str']}] {m['sender_name']}: {m['text'][:100]}")
 

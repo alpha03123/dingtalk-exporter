@@ -107,7 +107,7 @@ def do_sync(full=False):
 
     except Exception as e:
         log_event(logger, "error", "scheduler.sync_failed", error=e)
-        logger.error("scheduler.sync_failed_traceback", exc_info=True)
+        logger.exception("同步任务失败，异常堆栈如下")
         _sync_state["is_syncing"] = False
         _sync_state["last_error"] = str(e)
         _save_state()

@@ -80,11 +80,11 @@ def copy_encrypted_db(retry_count=None, retry_delay=None):
                 # Clean up partial copy
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise RuntimeError(
-                    f"Failed to copy encrypted database after {retry_count} attempts: {e}"
+                    f"复制钉钉加密数据库失败，已重试 {retry_count} 次：{e}"
                 )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
-    raise RuntimeError("Failed to copy encrypted database")
+    raise RuntimeError("复制钉钉加密数据库失败。")
 
 
 def _generate_v2_key(user_uid):
@@ -227,8 +227,8 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
         output_size = os.path.getsize(output_path)
         if output_size <= 0:
             raise RuntimeError(
-                "Decryption failed: output database is empty. "
-                "Please verify the detected DingTalk data directory and UID."
+                "解密失败：输出的数据库文件为空。"
+                "请确认自动识别到的 DingTalk 数据目录和 UID 是否正确。"
             )
         log_event(
             logger,
@@ -260,4 +260,4 @@ def sync_decrypt():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     path = sync_decrypt()
-    print(f"Decrypted database: {path}")
+    print(f"解密后的数据库已生成：{path}")
