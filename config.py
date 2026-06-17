@@ -77,7 +77,7 @@ def _load_redirected_dingtalk_bases():
 
 
 def _detect_v3_numeric_uid(data_dir, fallback_uid):
-    """Try to resolve the real numeric UID used by DingTalk V3 databases.
+    """Try to resolve the real UID used by DingTalk V3 databases.
 
     V3 folder names are not always the same as the chat-database UID. In
     practice, the real UID is commonly surfaced in local client logs.
@@ -87,10 +87,11 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
     if not os.path.isdir(log_dir):
         return fallback_uid, {"uid_source": "folder_name", "log_matches": 0}
 
+    token_pattern = r"([A-Za-z0-9]{6,64})"
     patterns = [
-        re.compile(r"uid=(\d{10})"),
-        re.compile(r"myOpenId=(\d{10})"),
-        re.compile(r"cid=(\d{10}):"),
+        re.compile(rf"uid={token_pattern}"),
+        re.compile(rf"myOpenId={token_pattern}"),
+        re.compile(rf"cid={token_pattern}:"),
     ]
     scores = {}
 
