@@ -23,6 +23,14 @@ _sync_state = {
 }
 
 
+def _apply_sync_overlap(timestamp_ms):
+    """Move the incremental cursor back slightly to avoid message gaps."""
+    if not timestamp_ms:
+        return 0
+    overlap_ms = max(0, int(config.SYNC_OVERLAP_SECONDS) * 1000)
+    return max(0, int(timestamp_ms) - overlap_ms)
+
+
 def _load_state():
     """Load sync state from file."""
     global _sync_state
@@ -63,34 +71,64 @@ def do_sync(full=False):
 
     try:
         log_event(logger, "info", "scheduler.sync_started", full=full)
+        previous_sync_time = _sync_state["last_sync_time"] or 0
 
         # Step 1: Decrypt
         decrypted_path = sync_decrypt()
         log_event(logger, "info", "scheduler.decrypt_ready", path=decrypted_path)
 
-        # Step 2: Get latest message time
-        conn = get_connection(decrypted_path)
-
         if full or not _sync_state["last_sync_time"]:
             # Full export on first run or when requested
             from exporter import export_all
             export_path = export_all()
+            exported_latest_time = None
             log_event(logger, "info", "scheduler.export_completed", mode="full", path=export_path)
         else:
             # Incremental export
-            export_path = export_incremental(_sync_state["last_sync_time"])
+            export_result = export_incremental(_sync_state["last_sync_time"])
+            export_path = export_result["path"]
+            exported_latest_time = export_result["max_created_at"]
             if export_path:
-                log_event(logger, "info", "scheduler.export_completed", mode="incremental", path=export_path)
+                log_event(
+                    logger,
+                    "info",
+                    "scheduler.export_completed",
+                    mode="incremental",
+                    path=export_path,
+                    message_count=export_result["message_count"],
+                    max_created_at=exported_latest_time,
+                )
             else:
                 log_event(logger, "info", "scheduler.export_skipped", reason="no_new_messages")
 
-        # Step 3: Update sync state
+        # Step 3: Re-open the database after export so we observe the final
+        # post-WAL state instead of an earlier reader snapshot.
+        conn = get_connection(decrypted_path)
         latest_time = get_latest_message_time(conn)
         conn.close()
 
-        _sync_state["last_sync_time"] = latest_time
+        if full or not previous_sync_time:
+            next_sync_time = _apply_sync_overlap(latest_time)
+        elif exported_latest_time:
+            next_sync_time = _apply_sync_overlap(exported_latest_time)
+        else:
+            next_sync_time = previous_sync_time
+
+        log_event(
+            logger,
+            "info",
+            "scheduler.cursor_updated",
+            previous_sync_time=previous_sync_time,
+            db_latest_time=latest_time,
+            exported_latest_time=exported_latest_time,
+            next_sync_time=next_sync_time,
+            overlap_seconds=config.SYNC_OVERLAP_SECONDS,
+        )
+
+        _sync_state["last_sync_time"] = next_sync_time
         _sync_state["last_sync_time_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _sync_state["last_export_path"] = export_path
+        if export_path:
+            _sync_state["last_export_path"] = export_path
         _sync_state["sync_count"] += 1
         _sync_state["is_syncing"] = False
 

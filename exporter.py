@@ -158,7 +158,12 @@ def export_incremental(since_time, base_dir=None):
             os.rmdir(export_dir)
         except OSError:
             pass
-        return None
+        return {
+            "path": None,
+            "message_count": 0,
+            "min_created_at": None,
+            "max_created_at": None,
+        }
 
     # Copy attachments before serialization
     log_event(
@@ -214,7 +219,12 @@ def export_incremental(since_time, base_dir=None):
         total_messages=len(all_messages),
         total_conversations=len(conv_messages),
     )
-    return export_dir
+    return {
+        "path": export_dir,
+        "message_count": len(all_messages),
+        "min_created_at": all_messages[0]["created_at"],
+        "max_created_at": all_messages[-1]["created_at"],
+    }
 
 
 def _serialize_message(msg):

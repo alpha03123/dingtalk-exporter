@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import struct
+import sqlite3
 
 from Crypto.Cipher import AES
 
@@ -264,6 +265,113 @@ def _remove_stale_decrypted_outputs(output_path):
             os.remove(path)
 
 
+def _get_snapshot_latest_time(db_path):
+    if not os.path.isfile(db_path):
+        return 0
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        table_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbmsg_%'"
+        ).fetchall()
+        latest = 0
+        for (table_name,) in table_rows:
+            row = conn.execute(f'SELECT MAX(createdAt) FROM "{table_name}"').fetchone()
+            if row and row[0] and row[0] > latest:
+                latest = row[0]
+        return latest
+    except sqlite3.Error as exc:
+        log_event(
+            logger,
+            "warning",
+            "decrypt.snapshot_inspect_failed",
+            path=db_path,
+            error=exc,
+        )
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _read_export_latest_time(export_path):
+    if not export_path:
+        return 0
+
+    json_path = os.path.join(export_path, "export.json")
+    if not os.path.isfile(json_path):
+        return 0
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log_event(
+            logger,
+            "warning",
+            "decrypt.snapshot_export_read_failed",
+            path=json_path,
+            error=exc,
+        )
+        return 0
+
+    latest = 0
+    for conversation in payload.get("conversations", []):
+        for message in conversation.get("messages", []):
+            created_at = message.get("created_at") or 0
+            if created_at > latest:
+                latest = created_at
+    return latest
+
+
+def _get_known_latest_time():
+    latest = 0
+    if os.path.isfile(config.SYNC_STATE_FILE):
+        try:
+            with open(config.SYNC_STATE_FILE, "r", encoding="utf-8") as f:
+                sync_state = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            log_event(
+                logger,
+                "warning",
+                "decrypt.snapshot_state_read_failed",
+                path=config.SYNC_STATE_FILE,
+                error=exc,
+            )
+        else:
+            latest = max(latest, _read_export_latest_time(sync_state.get("last_export_path")))
+            cursor_time = int(sync_state.get("last_sync_time") or 0)
+            if cursor_time:
+                latest = max(latest, cursor_time + int(config.SYNC_OVERLAP_SECONDS) * 1000)
+
+    latest = max(latest, _get_snapshot_latest_time(config.DECRYPTED_DB_PATH))
+    return latest
+
+
+def _promote_decrypted_snapshot(candidate_db_path, output_path):
+    _remove_stale_decrypted_outputs(output_path)
+    os.replace(candidate_db_path, output_path)
+
+    candidate_wal_path = candidate_db_path + "-wal"
+    if os.path.exists(candidate_wal_path):
+        os.replace(candidate_wal_path, output_path + "-wal")
+
+
+def _validate_snapshot_freshness(candidate_db_path):
+    candidate_latest = _get_snapshot_latest_time(candidate_db_path)
+    known_latest = _get_known_latest_time()
+    if known_latest and candidate_latest and candidate_latest < known_latest:
+        raise RuntimeError(
+            f"解密结果回退：候选快照最新消息时间 {candidate_latest} 早于当前已知最新时间 {known_latest}。"
+        )
+    return candidate_latest, known_latest
+
+
+def _can_use_existing_snapshot(output_path):
+    return os.path.isfile(output_path) and _get_snapshot_latest_time(output_path) > 0
+
+
 def _validate_decrypted_header(output_path):
     with open(output_path, "rb") as f:
         header = f.read(16)
@@ -292,9 +400,6 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
     if not os.path.isfile(encrypted_db_path):
         raise FileNotFoundError(f"待解密数据库不存在: {encrypted_db_path}")
 
-    # Remove any stale output files from earlier failed attempts.
-    _remove_stale_decrypted_outputs(output_path)
-
     log_event(
         logger,
         "info",
@@ -308,14 +413,19 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
     try:
         key_candidates = _build_database_keys()
         last_error = None
+        candidate_db_path = os.path.join(
+            os.path.dirname(encrypted_db_path),
+            "dingtalk_candidate.db",
+        )
+        _remove_stale_decrypted_outputs(candidate_db_path)
         for index, (key_uid, key) in enumerate(key_candidates):
             try:
-                _decrypt_database_pages(encrypted_db_path, output_path, key)
-                _validate_decrypted_header(output_path)
+                _decrypt_database_pages(encrypted_db_path, candidate_db_path, key)
+                _validate_decrypted_header(candidate_db_path)
 
                 encrypted_wal_path = encrypted_db_path + "-wal"
                 if os.path.isfile(encrypted_wal_path):
-                    wal_output_path = output_path + "-wal"
+                    wal_output_path = candidate_db_path + "-wal"
                     frame_count = _decrypt_wal_pages(encrypted_wal_path, wal_output_path, key)
                     log_event(
                         logger,
@@ -325,12 +435,24 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
                         frame_count=frame_count,
                         wal_size_mb=round(os.path.getsize(wal_output_path) / 1024 / 1024, 1),
                     )
+
+                candidate_latest, known_latest = _validate_snapshot_freshness(candidate_db_path)
+                _promote_decrypted_snapshot(candidate_db_path, output_path)
+                log_event(
+                    logger,
+                    "info",
+                    "decrypt.snapshot_promoted",
+                    output_db=output_path,
+                    candidate_latest_time=candidate_latest,
+                    known_latest_time=known_latest,
+                )
+                last_error = None
                 break
             except RuntimeError as exc:
                 last_error = exc
-                _remove_stale_decrypted_outputs(output_path)
+                _remove_stale_decrypted_outputs(candidate_db_path)
                 if index >= len(key_candidates) - 1:
-                    raise
+                    break
                 log_event(
                     logger,
                     "warning",
@@ -338,7 +460,16 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
                     uid_masked=config._mask_uid(key_uid),
                     remaining_candidates=len(key_candidates) - index - 1,
                 )
-        if last_error and not os.path.exists(output_path):
+        if last_error:
+            if _can_use_existing_snapshot(output_path):
+                log_event(
+                    logger,
+                    "warning",
+                    "decrypt.snapshot_fallback_used",
+                    output_db=output_path,
+                    error=last_error,
+                )
+                return output_path
             raise last_error
 
         output_size = os.path.getsize(output_path)

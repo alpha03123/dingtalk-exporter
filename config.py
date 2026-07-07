@@ -479,6 +479,7 @@ DINGWAVE_PATH = _detect_dingwave()
 
 # Sync settings
 SYNC_INTERVAL_HOURS = 4
+SYNC_OVERLAP_SECONDS = 24 *60
 COPY_RETRY_COUNT = 3
 COPY_RETRY_DELAY = 30  # seconds
 
