@@ -27,6 +27,7 @@ def _event_text(event, fields):
         "decrypt.header_mismatch": "解密结果校验失败，输出文件不是有效的 SQLite 数据库",
         "decrypt.started": "开始解密钉钉数据库",
         "decrypt.completed": "数据库解密完成",
+        "decrypt.wal_completed": "WAL 增量日志解密完成",
         "decrypt.temp_dir_cleaned": "临时解密目录已清理",
         "decrypt.sync_started": "开始执行数据库解密同步",
         "decrypt.sync_completed": "数据库解密同步完成",

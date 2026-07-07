@@ -6,6 +6,7 @@ import tempfile
 import base64
 import hashlib
 import json
+import struct
 
 from Crypto.Cipher import AES
 
@@ -15,6 +16,8 @@ from log_utils import log_event
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 4096
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
 V3_PBKDF2_SALT = b"666DingTalk888"[:8]
 V3_PBKDF2_ITERATIONS = 1000
 V3_PBKDF2_KEYLEN = 32
@@ -169,6 +172,32 @@ def _decrypt_page_in_place(block, page):
         )
 
 
+def _get_wal_page_size(wal_header):
+    page_size = int.from_bytes(wal_header[8:12], "big")
+    return 65536 if page_size == 1 else page_size
+
+
+def _get_wal_checksum_byteorder(wal_header):
+    magic = int.from_bytes(wal_header[:4], "big")
+    if magic == 0x377F0682:
+        return "little"
+    if magic == 0x377F0683:
+        return "big"
+    raise RuntimeError(f"解密失败：无法识别 WAL magic number: 0x{magic:08x}")
+
+
+def _update_wal_checksum(data, byteorder, s0=0, s1=0):
+    if len(data) % 8 != 0:
+        raise RuntimeError("解密失败：WAL 校验输入长度不是 8 的倍数。")
+
+    for offset in range(0, len(data), 8):
+        x0 = int.from_bytes(data[offset:offset + 4], byteorder)
+        x1 = int.from_bytes(data[offset + 4:offset + 8], byteorder)
+        s0 = (s0 + x0 + s1) & 0xFFFFFFFF
+        s1 = (s1 + x1 + s0) & 0xFFFFFFFF
+    return s0, s1
+
+
 def _decrypt_database_pages(input_path, output_path, key):
     block = AES.new(key, AES.MODE_ECB)
 
@@ -182,6 +211,57 @@ def _decrypt_database_pages(input_path, output_path, key):
                 _decrypt_page_in_place(block, page)
 
             dst.write(page)
+
+
+def _decrypt_wal_pages(input_path, output_path, key):
+    block = AES.new(key, AES.MODE_ECB)
+
+    with open(input_path, "rb") as src, open(output_path, "wb") as dst:
+        wal_header = src.read(WAL_HEADER_SIZE)
+        if not wal_header:
+            return 0
+        if len(wal_header) != WAL_HEADER_SIZE:
+            raise RuntimeError("解密失败：WAL 文件头长度异常。")
+        dst.write(wal_header)
+
+        page_size = _get_wal_page_size(wal_header)
+        checksum_byteorder = _get_wal_checksum_byteorder(wal_header)
+        checksum_1, checksum_2 = _update_wal_checksum(
+            wal_header[:24], checksum_byteorder
+        )
+
+        frame_count = 0
+        while True:
+            frame_header = bytearray(src.read(WAL_FRAME_HEADER_SIZE))
+            if not frame_header:
+                break
+            if len(frame_header) != WAL_FRAME_HEADER_SIZE:
+                raise RuntimeError("解密失败：WAL frame 头长度异常。")
+
+            page = bytearray(src.read(page_size))
+            if len(page) != page_size:
+                raise RuntimeError("解密失败：WAL frame 页数据长度异常。")
+
+            _decrypt_page_in_place(block, page)
+            checksum_1, checksum_2 = _update_wal_checksum(
+                bytes(frame_header[:8]) + bytes(page),
+                checksum_byteorder,
+                checksum_1,
+                checksum_2,
+            )
+            frame_header[16:20] = struct.pack(">I", checksum_1)
+            frame_header[20:24] = struct.pack(">I", checksum_2)
+            dst.write(frame_header)
+            dst.write(page)
+            frame_count += 1
+
+        return frame_count
+
+
+def _remove_stale_decrypted_outputs(output_path):
+    for path in [output_path, output_path + "-wal", output_path + "-shm"]:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def _validate_decrypted_header(output_path):
@@ -212,9 +292,8 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
     if not os.path.isfile(encrypted_db_path):
         raise FileNotFoundError(f"待解密数据库不存在: {encrypted_db_path}")
 
-    # Remove any stale output file from earlier failed attempts.
-    if os.path.exists(output_path):
-        os.remove(output_path)
+    # Remove any stale output files from earlier failed attempts.
+    _remove_stale_decrypted_outputs(output_path)
 
     log_event(
         logger,
@@ -233,9 +312,23 @@ def decrypt_database(encrypted_db_path=None, output_path=None):
             try:
                 _decrypt_database_pages(encrypted_db_path, output_path, key)
                 _validate_decrypted_header(output_path)
+
+                encrypted_wal_path = encrypted_db_path + "-wal"
+                if os.path.isfile(encrypted_wal_path):
+                    wal_output_path = output_path + "-wal"
+                    frame_count = _decrypt_wal_pages(encrypted_wal_path, wal_output_path, key)
+                    log_event(
+                        logger,
+                        "info",
+                        "decrypt.wal_completed",
+                        wal_db=wal_output_path,
+                        frame_count=frame_count,
+                        wal_size_mb=round(os.path.getsize(wal_output_path) / 1024 / 1024, 1),
+                    )
                 break
             except RuntimeError as exc:
                 last_error = exc
+                _remove_stale_decrypted_outputs(output_path)
                 if index >= len(key_candidates) - 1:
                     raise
                 log_event(
