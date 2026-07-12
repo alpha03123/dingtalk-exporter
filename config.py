@@ -310,6 +310,7 @@ def _detect_dingtalk_user():
     # macOS and Linux paths
     home = os.path.expanduser("~")
     if sys.platform == "darwin":
+        search_bases.append(os.path.join(home, "Library", "Application Support", "DingTalkMac"))
         search_bases.append(os.path.join(home, "Library", "Application Support", "DingTalk"))
     elif sys.platform.startswith("linux"):
         search_bases.append(os.path.join(home, ".config", "DingTalk"))
