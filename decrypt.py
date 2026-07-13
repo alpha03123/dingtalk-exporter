@@ -237,11 +237,26 @@ def _decrypt_wal_pages(input_path, output_path, key):
             if not frame_header:
                 break
             if len(frame_header) != WAL_FRAME_HEADER_SIZE:
-                raise RuntimeError("解密失败：WAL frame 头长度异常。")
+                log_event(
+                    logger,
+                    "warning",
+                    "decrypt.wal_truncated_frame_header",
+                    expected=WAL_FRAME_HEADER_SIZE,
+                    actual=len(frame_header),
+                )
+                break
 
             page = bytearray(src.read(page_size))
             if len(page) != page_size:
-                raise RuntimeError("解密失败：WAL frame 页数据长度异常。")
+                log_event(
+                    logger,
+                    "warning",
+                    "decrypt.wal_truncated_frame_page",
+                    expected=page_size,
+                    actual=len(page),
+                    frame=frame_count,
+                )
+                break
 
             _decrypt_page_in_place(block, page)
             checksum_1, checksum_2 = _update_wal_checksum(
