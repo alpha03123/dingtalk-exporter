@@ -174,10 +174,10 @@ def _detect_v3_numeric_uid(data_dir, fallback_uid):
         }
 
     patterns = [
-        re.compile(r"&uid=(\d{10})"),
-        re.compile(r"real_uid=(\d{10})"),
-        re.compile(r"myOpenId=(\d{10})"),
-        re.compile(r"&cid=(\d{10}):"),
+        re.compile(r"&uid=(\d{6,})"),
+        re.compile(r"real_uid=(\d{6,})"),
+        re.compile(r"myOpenId=(\d{6,})"),
+        re.compile(r"&cid=(\d{6,}):"),
     ]
     scores = {}
     uid_log_scores = {}

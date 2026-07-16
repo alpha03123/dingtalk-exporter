@@ -57,6 +57,24 @@ python main.py
 
 浏览器访问 http://localhost:8090
 
+### MCP 服务
+
+可将本地聊天记录能力作为 stdio MCP 服务运行：
+
+```bash
+python mcp_server.py
+```
+
+服务提供以下只读工具：
+
+- `dingtalk_health`：检查解密数据库和最新缓存消息时间
+- `dingtalk_sync`：同步并解密本地 DB/WAL
+- `dingtalk_list_chats`、`dingtalk_find_chats`：列出或查找会话
+- `dingtalk_get_chat_history`：按会话和日期范围获取历史消息
+- `dingtalk_search_messages`：全文搜索已缓存的消息
+
+WorkBuddy 等 MCP 客户端可将 `python mcp_server.py` 注册为 stdio 服务，并将工作目录设为本仓库根目录。
+
 > **无需配置** — 工具自动扫描 `%APPDATA%\DingTalk\`、`%LOCALAPPDATA%\DingTalk\` 等多个目录查找 `*_v2`、`*_v3` 用户数据。如果同一台电脑有多个钉钉账号，会自动选择最近使用的那个。
 
 ### 手动配置（仅在自动检测失败时需要）
