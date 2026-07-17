@@ -35,8 +35,10 @@ def _with_connection(callback):
 
 def _message(message: dict[str, Any], chat_name: str = "") -> dict[str, str]:
     return {
+        "message_id": str(message.get("id", "")),
         "time": message.get("created_at_str", ""),
         "speaker": message.get("sender_name", "") or "未知",
+        "content_type": message.get("content_type_name", "未知"),
         "content": message.get("text", "") or message.get("content_type_name", "[无文本内容]"),
         "chat_id": message.get("cid", ""),
         "chat_name": chat_name,
